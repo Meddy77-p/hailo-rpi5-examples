@@ -1,0 +1,7 @@
+{
+    "detection_threshold": 0.6,
+    "max_boxes":200,
+    "labels": [
+      "person", "drone", "vehicle", "weapon"
+    ]
+}

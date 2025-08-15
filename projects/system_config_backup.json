@@ -1,0 +1,26 @@
+{
+  "servo_params": {
+    "dead_zone": 12,
+    "smoothing_factor": 0.45,
+    "max_step_size": 8,
+    "pan_sensitivity": 55,
+    "tilt_sensitivity": 45,
+    "update_rate": 100
+  },
+  "camera_params": {
+    "fov_horizontal": 79.9,
+    "fov_vertical": 64.3,
+    "average_person_height": 1.7,
+    "average_person_width": 0.45
+  },
+  "gps_params": {
+    "update_interval": 0.5,
+    "min_distance": 2.0,
+    "altitude_offset": 2.0,
+    "accuracy_threshold": 3.0
+  },
+  "physical_setup": {
+    "servo_mount_height": 1.3,
+    "camera_tilt_offset": 5.0
+  }
+}

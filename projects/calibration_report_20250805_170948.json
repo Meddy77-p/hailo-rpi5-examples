@@ -1,0 +1,178 @@
+{
+  "timestamp": "2025-08-05T17:09:48.496556",
+  "system_info": {
+    "frame_size": [
+      640,
+      480
+    ],
+    "calibration_enabled": true,
+    "auto_save_enabled": true,
+    "realtime_validation_enabled": true
+  },
+  "calibration_parameters": {
+    "focal_length_x": 397.9992728261863,
+    "focal_length_y": 397.9992728261863,
+    "principal_point_x": 320.0,
+    "principal_point_y": 240.0,
+    "distortion_coefficients": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "camera_matrix": [
+      [
+        397.999267578125,
+        0.0,
+        320.0
+      ],
+      [
+        0.0,
+        397.999267578125,
+        240.0
+      ],
+      [
+        0.0,
+        0.0,
+        1.0
+      ]
+    ]
+  },
+  "calibration_status": {
+    "is_calibrated": false,
+    "confidence": 0.635459537422054,
+    "accuracy": 0.0,
+    "samples_collected": 43,
+    "reference_samples": 22,
+    "current_stage": "initial",
+    "focal_length_x": 397.9992728261863,
+    "focal_length_y": 397.9992728261863,
+    "principal_point": [
+      320.0,
+      240.0
+    ],
+    "frame_size": [
+      640,
+      480
+    ],
+    "performance_metrics": {
+      "mean_error": 0.033135608718315106,
+      "std_error": 0.020145677074219177,
+      "max_error": 0.08281636643236048,
+      "r_squared": 0.9971481488051294,
+      "rmse": 0.0387790777341597,
+      "mae": 0.033135608718315106
+    },
+    "enabled": true,
+    "stages": {
+      "initial": {
+        "complete": true,
+        "min_samples": 10,
+        "confidence_threshold": 0.5
+      },
+      "intermediate": {
+        "complete": false,
+        "min_samples": 30,
+        "confidence_threshold": 0.7
+      },
+      "advanced": {
+        "complete": false,
+        "min_samples": 100,
+        "confidence_threshold": 0.85
+      },
+      "final": {
+        "complete": false,
+        "min_samples": 200,
+        "confidence_threshold": 0.95
+      }
+    },
+    "methods": {
+      "distance_height": {
+        "enabled": true,
+        "samples": 43,
+        "weight": 0.4
+      },
+      "distance_width": {
+        "enabled": true,
+        "samples": 43,
+        "weight": 0.3
+      },
+      "angular_consistency": {
+        "enabled": true,
+        "samples": 43,
+        "weight": 0.2
+      },
+      "geometric_validation": {
+        "enabled": true,
+        "samples": 43,
+        "weight": 0.1
+      }
+    }
+  },
+  "performance_analysis": {
+    "total_samples": 43,
+    "reference_samples": 22,
+    "validation_errors": [],
+    "convergence_history": [
+      0.5676038189546138,
+      0.5689232726994842,
+      0.5744780658924761,
+      0.5802708174931799,
+      0.5856373224375612,
+      0.5909094905617356,
+      0.5919160138221663,
+      0.5932570813630057,
+      0.5990524821457048,
+      0.6007111186733725,
+      0.6023471842262794,
+      0.603923275610252,
+      0.6096327461254474,
+      0.611082265128625,
+      0.6126162564384557,
+      0.6181910584833199,
+      0.6235983720876078,
+      0.6290258498862507,
+      0.6342231090882573,
+      0.635459537422054
+    ]
+  },
+  "method_analysis": {
+    "distance_height": {
+      "total_samples": 43,
+      "enabled": true,
+      "weight": 0.4,
+      "sample_statistics": {
+        "confidence_mean": 0.8071816494470798,
+        "confidence_std": 0.07851256131526176
+      }
+    },
+    "distance_width": {
+      "total_samples": 43,
+      "enabled": true,
+      "weight": 0.3,
+      "sample_statistics": {
+        "confidence_mean": 0.8071816494470798,
+        "confidence_std": 0.07851256131526176
+      }
+    },
+    "angular_consistency": {
+      "total_samples": 43,
+      "enabled": true,
+      "weight": 0.2,
+      "sample_statistics": {
+        "confidence_mean": 0.8071816494470798,
+        "confidence_std": 0.07851256131526176
+      }
+    },
+    "geometric_validation": {
+      "total_samples": 43,
+      "enabled": true,
+      "weight": 0.1,
+      "sample_statistics": {
+        "confidence_mean": 0.8071816494470798,
+        "confidence_std": 0.07851256131526176
+      }
+    }
+  }
+}

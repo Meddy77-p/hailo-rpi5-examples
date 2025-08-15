@@ -1,0 +1,33 @@
+{
+  "start_time": "2025-07-23T11:46:54.768310",
+  "log_files": {
+    "csv": "/home/strikers/hailo-rpi5-examples/projects/servo_logs/servo_data_20250723_114654.csv",
+    "json": "/home/strikers/hailo-rpi5-examples/projects/servo_logs/session_20250723_114654.json"
+  },
+  "statistics": {
+    "total_detections": 636,
+    "total_movements": 580,
+    "min_distance": 4.319774400763708,
+    "max_distance": 5.408417649277882,
+    "avg_distance": 5.084473303401148,
+    "distance_samples": 636
+  },
+  "events": [
+    {
+      "timestamp": 1753289214.7811632,
+      "type": "servo_init",
+      "description": "Servo controller initialized"
+    },
+    {
+      "timestamp": 1753289216.2152796,
+      "type": "resolution_change",
+      "description": "Frame: 1280x720"
+    },
+    {
+      "timestamp": 1753289217.1090014,
+      "type": "target_lock",
+      "description": "Target locked at 5.11m"
+    }
+  ],
+  "end_time": "2025-07-23T11:47:16.718933"
+}

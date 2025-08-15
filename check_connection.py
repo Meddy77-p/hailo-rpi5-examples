@@ -1,0 +1,1473 @@
+from pathlib import Path
+import gi
+gi.require_version('Gst', '1.0')
+from gi.repository import Gst, GLib
+import os
+import numpy as np
+import cv2
+import hailo
+import time
+import board
+import busio
+from adafruit_motor import servo
+import adafruit_pca9685
+from collections import deque
+import threading
+from queue import Queue, Empty
+import json
+import csv
+from datetime import datetime
+import math
+from pymavlink import mavutil
+import serial
+from hailo_apps.hailo_app_python.core.common.buffer_utils import get_caps_from_pad, get_numpy_from_buffer
+from hailo_apps.hailo_app_python.core.gstreamer.gstreamer_app import app_callback_class
+from hailo_apps.hailo_app_python.apps.detection.detection_pipeline import GStreamerDetectionApp
+
+# -----------------------------------------------------------------------------------------------
+# CONFIGURATION CONSTANTS
+# -----------------------------------------------------------------------------------------------
+DEAD_ZONE = 15
+SMOOTHING_FACTOR = 0.35
+MAX_STEP_SIZE = 5
+MIN_CONFIDENCE = 0.3
+DETECTION_TIMEOUT = 2.0
+PAN_SENSITIVITY = 45
+TILT_SENSITIVITY = 35
+FRAME_SKIP_COUNT = 1
+DETECTION_HISTORY_SIZE = 3
+
+# Camera and distance calculation constants
+CAMERA_FOV_HORIZONTAL = 62.0  # degrees - typical webcam horizontal FOV
+CAMERA_FOV_VERTICAL = 48.0    # degrees - typical webcam vertical FOV
+AVERAGE_PERSON_HEIGHT = 1.7   # meters (5'7")
+AVERAGE_PERSON_WIDTH = 0.45   # meters (shoulder width)
+FOCAL_LENGTH_PIXELS = 600     # Approximate focal length in pixels (calibrate for your camera)
+
+# Servo mount geometry (adjust based on your setup)
+SERVO_MOUNT_HEIGHT = 1.5      # meters - height of camera above ground (ground test)
+PAN_SERVO_OFFSET = 0.0        # meters - horizontal offset from center
+TILT_SERVO_OFFSET = 0.0       # meters - vertical offset from rotation axis
+
+# Camera tilt offset due to weight (positive = camera tilted down)
+CAMERA_TILT_OFFSET = 5.0      # degrees - adjust based on your camera's actual tilt
+
+# MAVLink configuration for UART connection (RPi GPIO to CubeOrange TELEM2)
+MAVLINK_CONNECTION = '/dev/serial0'  # UART on Pi 5 GPIO 8/10 (try /dev/ttyAMA0 if this doesn't work)
+MAVLINK_BAUD = 57600  # Standard TELEM2 baud rate
+MAVLINK_SYSTEM_ID = 255  # GCS ID
+MAVLINK_COMPONENT_ID = 190  # Component ID for this system
+
+# GPS plotting configuration
+GPS_UPDATE_INTERVAL = 1.0  # seconds between GPS updates
+MIN_DISTANCE_FOR_GPS = 3.0  # minimum distance in meters to create GPS waypoint (larger for ground test)
+MAX_GPS_POINTS = 100  # maximum number of GPS points to store
+WAYPOINT_ALTITUDE_OFFSET = 0.0  # meters above current altitude (0 for ground test)
+GUIDED_MODE_AUTO_SET = False  # don't auto-set GUIDED mode for ground test
+
+# Calibration mode
+CALIBRATION_MODE = False  # Set to True to enable calibration mode
+CALIBRATION_DISTANCE = 2.0  # meters - distance to place person for calibration
+
+# -----------------------------------------------------------------------------------------------
+# MAVLINK GPS HANDLER CLASS
+# -----------------------------------------------------------------------------------------------
+class MAVLinkGPSHandler:
+    """Handle MAVLink communication with CubeOrange for GPS operations and waypoint guidance"""
+    
+    def __init__(self, connection_string=MAVLINK_CONNECTION, baud=MAVLINK_BAUD):
+        self.connection_string = connection_string
+        self.baud = baud
+        self.mavlink_connection = None
+        self.current_lat = 0.0
+        self.current_lon = 0.0
+        self.current_alt = 0.0
+        self.current_heading = 0.0  # Vehicle heading in degrees
+        self.gps_fix_type = 0
+        self.satellites_visible = 0
+        self.home_lat = None
+        self.home_lon = None
+        self.home_alt = None
+        
+        # Mission management
+        self.mission_count = 0
+        self.current_wp_seq = 0
+        self.active_waypoint = None
+        self.waypoint_reached_threshold = 5.0  # meters
+        
+        # Thread management
+        self.running = True
+        self.mavlink_thread = None
+        self.last_gps_update = 0
+        
+        # GPS points storage
+        self.gps_points = deque(maxlen=MAX_GPS_POINTS)
+        self.last_point_time = 0
+        
+        # Earth radius for calculations
+        self.EARTH_RADIUS = 6371000  # meters
+        
+        self.connect()
+    
+    def connect(self):
+        """Connect to CubeOrange via MAVLink"""
+        try:
+            print(f"🛰️ Connecting to CubeOrange at {self.connection_string}...")
+            
+            # Try USB/Serial connection
+            self.mavlink_connection = mavutil.mavlink_connection(
+                self.connection_string,
+                baud=self.baud,
+                source_system=MAVLINK_SYSTEM_ID,
+                source_component=MAVLINK_COMPONENT_ID
+            )
+            
+            # Wait for heartbeat
+            print("⏳ Waiting for heartbeat...")
+            self.mavlink_connection.wait_heartbeat(timeout=10)
+            print("✅ MAVLink connection established!")
+            
+            # Request data streams
+            self.request_data_streams()
+            
+            # Start receiver thread
+            self.mavlink_thread = threading.Thread(target=self._mavlink_receiver, daemon=True)
+            self.mavlink_thread.start()
+            
+            return True
+            
+        except Exception as e:
+            print(f"❌ MAVLink connection failed: {e}")
+            print("   Check: USB cable, device permissions (sudo usermod -a -G dialout $USER)")
+            return False
+    
+    def request_data_streams(self):
+        """Request GPS and attitude data streams from autopilot"""
+        try:
+            # Request all data streams at 10Hz
+            self.mavlink_connection.mav.request_data_stream_send(
+                self.mavlink_connection.target_system,
+                self.mavlink_connection.target_component,
+                mavutil.mavlink.MAV_DATA_STREAM_ALL,
+                10,  # Rate in Hz
+                1    # Start streaming
+            )
+            
+            # Specifically request GPS and attitude
+            message_rates = [
+                (mavutil.mavlink.MAVLINK_MSG_ID_GPS_RAW_INT, 5),
+                (mavutil.mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT, 5),
+                (mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE, 10),
+            ]
+            
+            for msg_id, rate in message_rates:
+                self.mavlink_connection.mav.command_long_send(
+                    self.mavlink_connection.target_system,
+                    self.mavlink_connection.target_component,
+                    mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                    0,
+                    msg_id,
+                    1000000 // rate,  # Interval in microseconds
+                    0, 0, 0, 0, 0
+                )
+                
+        except Exception as e:
+            print(f"Error requesting data streams: {e}")
+    
+    def _mavlink_receiver(self):
+        """Background thread to receive MAVLink messages"""
+        while self.running:
+            try:
+                msg = self.mavlink_connection.recv_match(blocking=True, timeout=0.1)
+                if msg is None:
+                    continue
+                
+                msg_type = msg.get_type()
+                
+                if msg_type == 'GPS_RAW_INT':
+                    self.current_lat = msg.lat / 1e7
+                    self.current_lon = msg.lon / 1e7
+                    self.current_alt = msg.alt / 1000.0
+                    self.gps_fix_type = msg.fix_type
+                    self.satellites_visible = msg.satellites_visible
+                    self.last_gps_update = time.time()
+                    
+                elif msg_type == 'GLOBAL_POSITION_INT':
+                    self.current_lat = msg.lat / 1e7
+                    self.current_lon = msg.lon / 1e7
+                    self.current_alt = msg.alt / 1000.0
+                    self.current_heading = msg.hdg / 100.0  # Convert from centidegrees
+                    
+                elif msg_type == 'ATTITUDE':
+                    # Can use this for more precise heading if needed
+                    yaw_rad = msg.yaw
+                    self.current_heading = math.degrees(yaw_rad) % 360
+                    
+                elif msg_type == 'HOME_POSITION':
+                    self.home_lat = msg.latitude / 1e7
+                    self.home_lon = msg.longitude / 1e7
+                    self.home_alt = msg.altitude / 1000.0
+                    print(f"🏠 Home position set: {self.home_lat:.6f}, {self.home_lon:.6f}")
+                    
+                elif msg_type == 'MISSION_CURRENT':
+                    self.current_wp_seq = msg.seq
+                    
+                elif msg_type == 'MISSION_ITEM_REACHED':
+                    print(f"✅ Reached waypoint {msg.seq}")
+                    if msg.seq == self.active_waypoint:
+                        self.active_waypoint = None
+                    
+            except Exception as e:
+                if self.running:
+                    print(f"MAVLink receive error: {e}")
+    
+    def calculate_gps_position(self, x_meters, y_meters):
+        """
+        Calculate GPS coordinates from relative position
+        
+        Args:
+            x_meters: Distance east (positive) or west (negative) in meters
+            y_meters: Distance north (positive) or south (negative) in meters
+            
+        Returns:
+            (latitude, longitude) tuple
+        """
+        if self.gps_fix_type < 3:  # No 3D fix
+            return None, None
+        
+        # Convert vehicle heading to bearing (0° = North)
+        bearing_to_target = math.degrees(math.atan2(x_meters, y_meters))
+        absolute_bearing = (self.current_heading + bearing_to_target) % 360
+        
+        # Distance to target
+        distance = math.sqrt(x_meters**2 + y_meters**2)
+        
+        # Calculate new GPS position
+        lat_rad = math.radians(self.current_lat)
+        lon_rad = math.radians(self.current_lon)
+        bearing_rad = math.radians(absolute_bearing)
+        
+        # Calculate new latitude
+        new_lat_rad = math.asin(
+            math.sin(lat_rad) * math.cos(distance / self.EARTH_RADIUS) +
+            math.cos(lat_rad) * math.sin(distance / self.EARTH_RADIUS) * math.cos(bearing_rad)
+        )
+        
+        # Calculate new longitude
+        new_lon_rad = lon_rad + math.atan2(
+            math.sin(bearing_rad) * math.sin(distance / self.EARTH_RADIUS) * math.cos(lat_rad),
+            math.cos(distance / self.EARTH_RADIUS) - math.sin(lat_rad) * math.sin(new_lat_rad)
+        )
+        
+        new_lat = math.degrees(new_lat_rad)
+        new_lon = math.degrees(new_lon_rad)
+        
+        return new_lat, new_lon
+    
+    def add_detection_point(self, x_meters, y_meters, z_meters, confidence):
+        """Add a detected person's position as a GPS waypoint for UAV guidance"""
+        # Check if enough time has passed
+        current_time = time.time()
+        if current_time - self.last_point_time < GPS_UPDATE_INTERVAL:
+            return None
+        
+        # Check minimum distance threshold
+        distance = math.sqrt(x_meters**2 + y_meters**2)
+        if distance < MIN_DISTANCE_FOR_GPS:
+            return None
+        
+        # Calculate GPS position
+        lat, lon = self.calculate_gps_position(x_meters, y_meters)
+        
+        if lat is None or lon is None:
+            return None
+        
+        # Calculate altitude for waypoint (maintain current altitude + safety margin)
+        waypoint_alt = self.current_alt + WAYPOINT_ALTITUDE_OFFSET
+        
+        # Create GPS point
+        gps_point = {
+            'timestamp': current_time,
+            'latitude': lat,
+            'longitude': lon,
+            'altitude': waypoint_alt,
+            'relative_x': x_meters,
+            'relative_y': y_meters,
+            'relative_z': z_meters,
+            'distance': distance,
+            'confidence': confidence,
+            'vehicle_lat': self.current_lat,
+            'vehicle_lon': self.current_lon,
+            'vehicle_heading': self.current_heading
+        }
+        
+        self.gps_points.append(gps_point)
+        self.last_point_time = current_time
+        
+        # Send waypoint to autopilot for guidance
+        success = self.send_guided_waypoint(lat, lon, waypoint_alt, distance)
+        
+        if success:
+            print(f"🎯 New waypoint sent: {distance:.1f}m away at bearing {self.calculate_bearing(x_meters, y_meters):.0f}°")
+            self.active_waypoint = lat, lon
+        
+        return gps_point
+    
+    def calculate_bearing(self, x_meters, y_meters):
+        """Calculate bearing to target from current position"""
+        bearing = math.degrees(math.atan2(x_meters, y_meters))
+        return (self.current_heading + bearing) % 360
+    
+    def send_guided_waypoint(self, lat, lon, alt, distance):
+        """Send waypoint to autopilot in GUIDED mode for immediate navigation"""
+        try:
+            # First, check if we're in GUIDED mode
+            if not self.check_guided_mode():
+                print("⚠️  Vehicle not in GUIDED mode. Sending waypoint for mission planning instead.")
+                return self.add_mission_waypoint(lat, lon, alt)
+            
+            # Send position target for GUIDED mode
+            self.mavlink_connection.mav.set_position_target_global_int_send(
+                0,  # time_boot_ms
+                self.mavlink_connection.target_system,
+                self.mavlink_connection.target_component,
+                mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+                0b0000111111111000,  # Type mask (only position)
+                int(lat * 1e7),      # latitude in degE7
+                int(lon * 1e7),      # longitude in degE7
+                alt,                 # altitude in meters
+                0, 0, 0,            # velocity (not used)
+                0, 0, 0,            # acceleration (not used)
+                0, 0                # yaw, yaw_rate (not used)
+            )
+            
+            # Send command to navigate to waypoint
+            self.mavlink_connection.mav.command_long_send(
+                self.mavlink_connection.target_system,
+                self.mavlink_connection.target_component,
+                mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+                0,  # confirmation
+                0,  # param1 - hold time
+                self.waypoint_reached_threshold,  # param2 - acceptance radius
+                0,  # param3 - pass through
+                0,  # param4 - yaw
+                lat,  # param5 - latitude
+                lon,  # param6 - longitude
+                alt   # param7 - altitude
+            )
+            
+            # Log the waypoint
+            print(f"📍 Guided waypoint sent: Lat={lat:.6f}, Lon={lon:.6f}, Alt={alt:.1f}m")
+            return True
+            
+        except Exception as e:
+            print(f"Error sending guided waypoint: {e}")
+            return False
+    
+    def add_mission_waypoint(self, lat, lon, alt):
+        """Add waypoint to mission (for AUTO mode)"""
+        try:
+            # Request current mission count
+            self.mavlink_connection.mav.mission_request_list_send(
+                self.mavlink_connection.target_system,
+                self.mavlink_connection.target_component
+            )
+            
+            # Wait for mission count response
+            msg = self.mavlink_connection.recv_match(type='MISSION_COUNT', timeout=2)
+            if msg:
+                current_count = msg.count
+            else:
+                current_count = 0
+            
+            # Send new mission count
+            new_count = current_count + 1
+            self.mavlink_connection.mav.mission_count_send(
+                self.mavlink_connection.target_system,
+                self.mavlink_connection.target_component,
+                new_count
+            )
+            
+            # Send the new waypoint
+            self.mavlink_connection.mav.mission_item_int_send(
+                self.mavlink_connection.target_system,
+                self.mavlink_connection.target_component,
+                current_count,  # sequence number
+                mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+                mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+                0,  # current (0=not current waypoint)
+                1,  # autocontinue
+                0,  # param1 - hold time
+                self.waypoint_reached_threshold,  # param2 - acceptance radius
+                0,  # param3 - pass through
+                0,  # param4 - yaw
+                int(lat * 1e7),  # x - latitude
+                int(lon * 1e7),  # y - longitude
+                alt,  # z - altitude
+                mavutil.mavlink.MAV_MISSION_ACCEPTED  # mission_type
+            )
+            
+            print(f"📋 Mission waypoint {current_count} added")
+            return True
+            
+        except Exception as e:
+            print(f"Error adding mission waypoint: {e}")
+            return False
+    
+    def check_guided_mode(self):
+        """Check if vehicle is in GUIDED mode"""
+        try:
+            # Request heartbeat to get mode
+            msg = self.mavlink_connection.recv_match(type='HEARTBEAT', blocking=False)
+            if msg:
+                # Check if custom mode indicates GUIDED (mode 4 for ArduCopter)
+                mode = msg.custom_mode
+                if msg.autopilot == mavutil.mavlink.MAV_AUTOPILOT_ARDUPILOTMEGA:
+                    # ArduCopter GUIDED mode
+                    return mode == 4
+                else:
+                    # Generic check for GUIDED mode flag
+                    return msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_GUIDED_ENABLED
+            return False
+        except:
+            return False
+    
+    def set_guided_mode(self):
+        """Attempt to set vehicle to GUIDED mode"""
+        try:
+            # Set mode to GUIDED
+            self.mavlink_connection.mav.set_mode_send(
+                self.mavlink_connection.target_system,
+                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                4  # GUIDED mode for ArduCopter
+            )
+            
+            # Alternative method using command
+            self.mavlink_connection.mav.command_long_send(
+                self.mavlink_connection.target_system,
+                self.mavlink_connection.target_component,
+                mavutil.mavlink.MAV_CMD_DO_SET_MODE,
+                0,
+                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                4,  # GUIDED mode
+                0, 0, 0, 0, 0
+            )
+            
+            print("🚁 Requested GUIDED mode")
+            return True
+            
+        except Exception as e:
+            print(f"Error setting GUIDED mode: {e}")
+            return False
+    
+    def clear_mission(self):
+        """Clear all waypoints from mission"""
+        try:
+            self.mavlink_connection.mav.mission_clear_all_send(
+                self.mavlink_connection.target_system,
+                self.mavlink_connection.target_component
+            )
+            print("🗑️  Mission cleared")
+            return True
+        except Exception as e:
+            print(f"Error clearing mission: {e}")
+            return False
+    
+    def return_to_launch(self):
+        """Command vehicle to return to launch"""
+        try:
+            self.mavlink_connection.mav.command_long_send(
+                self.mavlink_connection.target_system,
+                self.mavlink_connection.target_component,
+                mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH,
+                0, 0, 0, 0, 0, 0, 0, 0
+            )
+            print("🏠 Return to Launch commanded")
+            return True
+        except Exception as e:
+            print(f"Error commanding RTL: {e}")
+            return False
+    
+    def export_gps_points(self, filename="detected_persons_gps.kml"):
+        """Export GPS points to KML file for Google Earth"""
+        kml_template = """<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+<Document>
+    <name>Detected Persons</name>
+    <Style id="person_icon">
+        <IconStyle>
+            <color>ff0000ff</color>
+            <scale>1.0</scale>
+            <Icon>
+                <href>http://maps.google.com/mapfiles/kml/shapes/man.png</href>
+            </Icon>
+        </IconStyle>
+    </Style>
+    {placemarks}
+</Document>
+</kml>"""
+        
+        placemark_template = """
+    <Placemark>
+        <name>Person {index}</name>
+        <description>
+            Time: {time}
+            Confidence: {confidence:.2f}
+            Distance: {distance:.1f}m
+            Vehicle Heading: {heading:.1f}°
+        </description>
+        <styleUrl>#person_icon</styleUrl>
+        <Point>
+            <coordinates>{lon},{lat},{alt}</coordinates>
+        </Point>
+    </Placemark>"""
+        
+        placemarks = []
+        for i, point in enumerate(self.gps_points):
+            placemark = placemark_template.format(
+                index=i+1,
+                time=datetime.fromtimestamp(point['timestamp']).strftime('%Y-%m-%d %H:%M:%S'),
+                confidence=point['confidence'],
+                distance=point['distance'],
+                heading=point['vehicle_heading'],
+                lon=point['longitude'],
+                lat=point['latitude'],
+                alt=point['altitude']
+            )
+            placemarks.append(placemark)
+        
+        kml_content = kml_template.format(placemarks=''.join(placemarks))
+        
+        # Save in the same directory as logs
+        script_dir = Path(__file__).resolve().parent
+        kml_path = script_dir / "servo_logs" / filename
+        
+        with open(kml_path, 'w') as f:
+            f.write(kml_content)
+        
+        print(f"📍 Exported {len(self.gps_points)} GPS points to {kml_path}")
+    
+    def get_status(self):
+        """Get current GPS and MAVLink status"""
+        status = {
+            'connected': self.mavlink_connection is not None,
+            'gps_fix': self.gps_fix_type,
+            'satellites': self.satellites_visible,
+            'latitude': self.current_lat,
+            'longitude': self.current_lon,
+            'altitude': self.current_alt,
+            'heading': self.current_heading,
+            'last_update': time.time() - self.last_gps_update,
+            'points_logged': len(self.gps_points),
+            'mode': 'UNKNOWN'
+        }
+        
+        # Try to get current mode
+        if self.check_guided_mode():
+            status['mode'] = 'GUIDED'
+        else:
+            # Could expand this to detect other modes
+            status['mode'] = 'OTHER'
+        
+        return status
+    
+    def shutdown(self):
+        """Clean shutdown"""
+        self.running = False
+        if self.mavlink_thread:
+            self.mavlink_thread.join(timeout=2.0)
+        
+        if self.mavlink_connection:
+            self.mavlink_connection.close()
+        
+        # Export GPS points before shutdown
+        if self.gps_points:
+            self.export_gps_points()
+
+# -----------------------------------------------------------------------------------------------
+# ENHANCED DATA LOGGER CLASS WITH GPS
+# -----------------------------------------------------------------------------------------------
+class ServoDataLogger:
+    """Enhanced data logging with distance and GPS tracking"""
+    
+    def __init__(self, log_dir="servo_logs", gps_handler=None):
+        self.gps_handler = gps_handler
+        
+        # Create log directory relative to the script location
+        script_dir = Path(__file__).resolve().parent
+        self.log_dir = script_dir / log_dir
+        
+        print(f"🔍 Script location: {script_dir}")
+        print(f"🔍 Current working directory: {Path.cwd()}")
+        print(f"📊 Creating logs in: {self.log_dir}")
+        
+        self.log_dir.mkdir(exist_ok=True)
+        
+        # Create timestamped log files
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.csv_file = self.log_dir / f"servo_data_{timestamp}.csv"
+        self.json_file = self.log_dir / f"session_{timestamp}.json"
+        self.gps_csv_file = self.log_dir / f"gps_points_{timestamp}.csv"
+        
+        # Enhanced CSV headers with GPS data
+        self.csv_headers = [
+            'timestamp', 'frame_count', 'pan_angle', 'tilt_angle', 
+            'pan_velocity', 'tilt_velocity', 'detection_confidence', 
+            'person_detected', 'tracking_active', 'target_lost_frames',
+            'distance_meters', 'x_position', 'y_position', 'z_position',
+            'angular_width', 'angular_height', 'bbox_width', 'bbox_height',
+            'gps_latitude', 'gps_longitude', 'gps_altitude'
+        ]
+        
+        with open(self.csv_file, 'w', newline='') as f:
+            csv.writer(f).writerow(self.csv_headers)
+        
+        # GPS points CSV
+        self.gps_headers = [
+            'timestamp', 'detection_lat', 'detection_lon', 'detection_alt',
+            'vehicle_lat', 'vehicle_lon', 'vehicle_heading', 
+            'relative_x', 'relative_y', 'relative_z', 'confidence'
+        ]
+        
+        with open(self.gps_csv_file, 'w', newline='') as f:
+            csv.writer(f).writerow(self.gps_headers)
+        
+        # Session tracking with GPS statistics
+        self.session_data = {
+            'start_time': datetime.now().isoformat(),
+            'log_files': {
+                'csv': str(self.csv_file),
+                'json': str(self.json_file),
+                'gps_csv': str(self.gps_csv_file)
+            },
+            'statistics': {
+                'total_detections': 0, 
+                'total_movements': 0,
+                'min_distance': float('inf'),
+                'max_distance': 0.0,
+                'avg_distance': 0.0,
+                'distance_samples': 0,
+                'gps_points_created': 0
+            },
+            'events': []
+        }
+        
+        print(f"📊 Data logging to: {self.log_dir}")
+        print(f"   CSV: {self.csv_file.name}")
+        print(f"   GPS: {self.gps_csv_file.name}")
+        print(f"   JSON: {self.json_file.name}")
+        
+    def log_frame_data(self, frame_count, pan_angle, tilt_angle, pan_velocity, 
+                      tilt_velocity, detection_confidence, person_detected, 
+                      tracking_active, target_lost_frames, distance_data=None):
+        """Log enhanced frame data including distance and GPS"""
+        try:
+            # Default values
+            distance = x_pos = y_pos = z_pos = 0.0
+            angular_width = angular_height = bbox_width = bbox_height = 0.0
+            gps_lat = gps_lon = gps_alt = 0.0
+            
+            if distance_data:
+                distance = distance_data.get('distance', 0.0)
+                x_pos = distance_data.get('x_position', 0.0)
+                y_pos = distance_data.get('y_position', 0.0)
+                z_pos = distance_data.get('z_position', 0.0)
+                angular_width = distance_data.get('angular_width', 0.0)
+                angular_height = distance_data.get('angular_height', 0.0)
+                bbox_width = distance_data.get('bbox_width', 0.0)
+                bbox_height = distance_data.get('bbox_height', 0.0)
+                
+                # Try to create GPS point
+                if self.gps_handler and distance >= MIN_DISTANCE_FOR_GPS:
+                    gps_point = self.gps_handler.add_detection_point(
+                        x_pos, y_pos, z_pos, detection_confidence
+                    )
+                    
+                    if gps_point:
+                        gps_lat = gps_point['latitude']
+                        gps_lon = gps_point['longitude']
+                        gps_alt = gps_point['altitude']
+                        self.session_data['statistics']['gps_points_created'] += 1
+                        
+                        # Log to GPS CSV
+                        with open(self.gps_csv_file, 'a', newline='') as f:
+                            writer = csv.writer(f)
+                            writer.writerow([
+                                gps_point['timestamp'],
+                                gps_point['latitude'],
+                                gps_point['longitude'],
+                                gps_point['altitude'],
+                                gps_point['vehicle_lat'],
+                                gps_point['vehicle_lon'],
+                                gps_point['vehicle_heading'],
+                                gps_point['relative_x'],
+                                gps_point['relative_y'],
+                                gps_point['relative_z'],
+                                gps_point['confidence']
+                            ])
+                
+                # Update distance statistics
+                if distance > 0:
+                    stats = self.session_data['statistics']
+                    stats['min_distance'] = min(stats['min_distance'], distance)
+                    stats['max_distance'] = max(stats['max_distance'], distance)
+                    stats['distance_samples'] += 1
+                    stats['avg_distance'] = (
+                        (stats['avg_distance'] * (stats['distance_samples'] - 1) + distance) / 
+                        stats['distance_samples']
+                    )
+            
+            # Log to main CSV
+            with open(self.csv_file, 'a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    time.time(), frame_count, pan_angle, tilt_angle,
+                    pan_velocity, tilt_velocity, detection_confidence,
+                    person_detected, tracking_active, target_lost_frames,
+                    distance, x_pos, y_pos, z_pos,
+                    angular_width, angular_height, bbox_width, bbox_height,
+                    gps_lat, gps_lon, gps_alt
+                ])
+            
+            # Update other statistics
+            if person_detected:
+                self.session_data['statistics']['total_detections'] += 1
+            if abs(pan_velocity) > 1 or abs(tilt_velocity) > 1:
+                self.session_data['statistics']['total_movements'] += 1
+                
+        except Exception as e:
+            print(f"Logging error: {e}")
+    
+    def log_event(self, event_type, description):
+        """Log significant events"""
+        event = {
+            'timestamp': time.time(),
+            'type': event_type,
+            'description': description
+        }
+        self.session_data['events'].append(event)
+        print(f"📝 {event_type}: {description}")
+    
+    def finalize_session(self):
+        """Save final session data"""
+        self.session_data['end_time'] = datetime.now().isoformat()
+        
+        # Add GPS status if available
+        if self.gps_handler:
+            self.session_data['gps_status'] = self.gps_handler.get_status()
+        
+        try:
+            with open(self.json_file, 'w') as f:
+                json.dump(self.session_data, f, indent=2)
+            
+            stats = self.session_data['statistics']
+            print(f"\n📊 Session Complete:")
+            print(f"   Detections: {stats['total_detections']}")
+            print(f"   Movements: {stats['total_movements']}")
+            print(f"   GPS Points: {stats['gps_points_created']}")
+            if stats['distance_samples'] > 0:
+                print(f"   Distance Range: {stats['min_distance']:.2f}m - {stats['max_distance']:.2f}m")
+                print(f"   Average Distance: {stats['avg_distance']:.2f}m")
+            print(f"   Data saved to: {self.log_dir}")
+            
+            # Verify files exist
+            print(f"\n📁 Final file verification:")
+            for file_type, file_path in [
+                ('CSV', self.csv_file),
+                ('GPS CSV', self.gps_csv_file),
+                ('JSON', self.json_file)
+            ]:
+                if Path(file_path).exists():
+                    size = Path(file_path).stat().st_size
+                    print(f"✅ {file_type}: {file_path} ({size} bytes)")
+                else:
+                    print(f"❌ {file_type} missing: {file_path}")
+            
+        except Exception as e:
+            print(f"Session save error: {e}")
+
+# -----------------------------------------------------------------------------------------------
+# DISTANCE CALCULATOR CLASS
+# -----------------------------------------------------------------------------------------------
+class DistanceCalculator:
+    """Calculate distance to person using multiple methods"""
+    
+    def __init__(self, frame_width=640, frame_height=480):
+        self.frame_width = frame_width
+        self.frame_height = frame_height
+        
+        # Calculate focal length based on FOV
+        self.focal_length_x = frame_width / (2 * math.tan(math.radians(CAMERA_FOV_HORIZONTAL / 2)))
+        self.focal_length_y = frame_height / (2 * math.tan(math.radians(CAMERA_FOV_VERTICAL / 2)))
+        
+        # Distance history for smoothing
+        self.distance_history = deque(maxlen=5)
+        
+    def update_frame_size(self, width, height):
+        """Update frame dimensions and recalculate focal lengths"""
+        self.frame_width = width
+        self.frame_height = height
+        self.focal_length_x = width / (2 * math.tan(math.radians(CAMERA_FOV_HORIZONTAL / 2)))
+        self.focal_length_y = height / (2 * math.tan(math.radians(CAMERA_FOV_VERTICAL / 2)))
+    
+    def calculate_distance_from_bbox(self, bbox):
+        """Calculate distance using bounding box size"""
+        # Get bbox dimensions in pixels
+        bbox_width_pixels = bbox.width() * self.frame_width
+        bbox_height_pixels = bbox.height() * self.frame_height
+        
+        # Method 1: Using height (more reliable for standing persons)
+        distance_from_height = (AVERAGE_PERSON_HEIGHT * self.focal_length_y) / bbox_height_pixels
+        
+        # Method 2: Using width
+        distance_from_width = (AVERAGE_PERSON_WIDTH * self.focal_length_x) / bbox_width_pixels
+        
+        # Weighted average (height is usually more reliable)
+        distance = (distance_from_height * 0.7 + distance_from_width * 0.3)
+        
+        # Add to history and return smoothed value
+        self.distance_history.append(distance)
+        return self._get_smoothed_distance()
+    
+    def calculate_3d_position(self, bbox, pan_angle, tilt_angle, distance):
+        """Calculate 3D position of person relative to servo mount"""
+        # Get person center in normalized coordinates
+        center_x = bbox.xmin() + bbox.width() / 2
+        center_y = bbox.ymin() + bbox.height() / 2
+        
+        # Convert servo angles to radians
+        pan_rad = math.radians(pan_angle - 90)  # 90 degrees is center
+        
+        # Apply camera tilt offset correction
+        actual_tilt_angle = tilt_angle + CAMERA_TILT_OFFSET
+        tilt_rad = math.radians(90 - actual_tilt_angle)  # 90 degrees is level
+        
+        # Calculate horizontal distance (ground projection)
+        horizontal_distance = distance * math.cos(tilt_rad)
+        
+        # Calculate 3D coordinates
+        x = horizontal_distance * math.sin(pan_rad)
+        y = horizontal_distance * math.cos(pan_rad)
+        z = distance * math.sin(tilt_rad) + SERVO_MOUNT_HEIGHT
+        
+        return x, y, z
+    
+    def calculate_angular_size(self, bbox):
+        """Calculate angular size of detected person"""
+        # Angular width and height in degrees
+        angular_width = (bbox.width() * CAMERA_FOV_HORIZONTAL)
+        angular_height = (bbox.height() * CAMERA_FOV_VERTICAL)
+        
+        return angular_width, angular_height
+    
+    def _get_smoothed_distance(self):
+        """Get smoothed distance from history"""
+        if not self.distance_history:
+            return 0.0
+        
+        # Remove outliers (simple method)
+        sorted_distances = sorted(self.distance_history)
+        if len(sorted_distances) >= 3:
+            # Remove highest and lowest
+            filtered = sorted_distances[1:-1]
+        else:
+            filtered = sorted_distances
+        
+        return sum(filtered) / len(filtered) if filtered else sorted_distances[0]
+
+# -----------------------------------------------------------------------------------------------
+# CALIBRATION MODE
+# -----------------------------------------------------------------------------------------------
+class CalibrationHelper:
+    """Helper class for camera calibration"""
+    
+    def __init__(self):
+        self.measurements = []
+        self.calibrating = CALIBRATION_MODE
+        
+    def add_measurement(self, bbox, frame_height):
+        """Add a bounding box measurement during calibration"""
+        if not self.calibrating:
+            return
+            
+        # Calculate person height in pixels
+        person_height_pixels = bbox.height() * frame_height
+        
+        if person_height_pixels > 50:  # Minimum height threshold
+            self.measurements.append(person_height_pixels)
+            
+            if len(self.measurements) >= 10:
+                # Calculate average after 10 measurements
+                avg_height = sum(self.measurements) / len(self.measurements)
+                focal_length = self.calculate_focal_length(CALIBRATION_DISTANCE, avg_height)
+                
+                print(f"\n📸 CALIBRATION COMPLETE!")
+                print(f"   Average person height: {avg_height:.1f} pixels")
+                print(f"   Calculated focal length: {focal_length:.1f} pixels")
+                print(f"   Current focal length: {FOCAL_LENGTH_PIXELS} pixels")
+                print(f"\n✏️  Update your code:")
+                print(f"   FOCAL_LENGTH_PIXELS = {focal_length:.1f}")
+                print(f"\n💡 Also update CAMERA_FOV values if needed:")
+                print(f"   CAMERA_FOV_HORIZONTAL = {self.calculate_fov_horizontal(focal_length):.1f}")
+                print(f"   CAMERA_FOV_VERTICAL = {self.calculate_fov_vertical(focal_length):.1f}")
+                
+                self.calibrating = False
+                self.measurements = []
+    
+    def calculate_focal_length(self, known_distance, height_pixels):
+        """Calculate focal length from known distance and pixel height"""
+        return (height_pixels * known_distance) / AVERAGE_PERSON_HEIGHT
+    
+    def calculate_fov_horizontal(self, focal_length):
+        """Calculate horizontal FOV from focal length"""
+        return 2 * math.degrees(math.atan(tracker.frame_width / (2 * focal_length)))
+    
+    def calculate_fov_vertical(self, focal_length):
+        """Calculate vertical FOV from focal length"""
+        return 2 * math.degrees(math.atan(tracker.frame_height / (2 * focal_length)))
+
+# -----------------------------------------------------------------------------------------------
+# SERVO CONTROLLER
+# -----------------------------------------------------------------------------------------------
+class FastServoController:
+    """Optimized servo controller with logging"""
+    
+    def __init__(self, logger=None):
+        self.logger = logger
+        
+        # Hardware setup
+        self.i2c = busio.I2C(board.SCL, board.SDA)
+        self.pca = adafruit_pca9685.PCA9685(self.i2c)
+        self.pca.frequency = 50
+        
+        self.pan_servo = servo.Servo(self.pca.channels[0])
+        self.tilt_servo = servo.Servo(self.pca.channels[2])
+        
+        # State variables with tilt offset
+        self.current_pan = 90.0
+        self.current_tilt = 90.0 - CAMERA_TILT_OFFSET  # Compensate for camera tilt
+        self.velocity_pan = 0.0
+        self.velocity_tilt = 0.0
+        self.last_update_time = time.time()
+        
+        # Initialize servos
+        self.pan_servo.angle = self.current_pan
+        self.tilt_servo.angle = self.current_tilt
+        
+        # Threading
+        self.command_queue = Queue(maxsize=5)
+        self.running = True
+        self.servo_thread = threading.Thread(target=self._servo_worker, daemon=True)
+        self.servo_thread.start()
+        
+        if self.logger:
+            self.logger.log_event('servo_init', 'Servo controller initialized')
+        
+    def _servo_worker(self):
+        """Background servo movement thread"""
+        while self.running:
+            try:
+                command = self.command_queue.get(timeout=0.05)
+                if command is None:
+                    break
+                    
+                pan_angle, tilt_angle = command
+                current_time = time.time()
+                dt = current_time - self.last_update_time
+                
+                # Calculate velocities
+                if dt > 0:
+                    self.velocity_pan = (pan_angle - self.current_pan) / dt
+                    self.velocity_tilt = (tilt_angle - self.current_tilt) / dt
+                
+                # Move servos if significant change
+                if (abs(pan_angle - self.current_pan) > 0.1 or 
+                    abs(tilt_angle - self.current_tilt) > 0.1):
+                    
+                    try:
+                        self.pan_servo.angle = pan_angle
+                        self.tilt_servo.angle = tilt_angle
+                        self.current_pan = pan_angle
+                        self.current_tilt = tilt_angle
+                        time.sleep(0.005)  # 5ms delay
+                        
+                    except Exception as e:
+                        print(f"Servo movement error: {e}")
+                
+                self.last_update_time = current_time
+                
+            except Empty:
+                continue
+            except Exception as e:
+                print(f"Servo thread error: {e}")
+    
+    def move_to(self, pan_angle, tilt_angle):
+        """Queue servo movement"""
+        pan_angle = max(0, min(180, pan_angle))
+        tilt_angle = max(0, min(180, tilt_angle))
+        
+        try:
+            # Clear queue for latest command
+            while not self.command_queue.empty():
+                try:
+                    self.command_queue.get_nowait()
+                except Empty:
+                    break
+            self.command_queue.put_nowait((pan_angle, tilt_angle))
+        except:
+            pass
+    
+    def get_current_state(self):
+        """Get current angles and velocities"""
+        return self.current_pan, self.current_tilt, self.velocity_pan, self.velocity_tilt
+    
+    def shutdown(self):
+        """Clean shutdown"""
+        if self.logger:
+            self.logger.log_event('servo_shutdown', 'Servo controller shutting down')
+        
+        self.running = False
+        self.command_queue.put(None)
+        self.servo_thread.join(timeout=1.0)
+        
+        try:
+            self.pan_servo.angle = 90
+            self.tilt_servo.angle = 90
+        except:
+            pass
+
+# -----------------------------------------------------------------------------------------------
+# ENHANCED TRACKER WITH DISTANCE
+# -----------------------------------------------------------------------------------------------
+class UltraFastTracker:
+    """Enhanced person tracker with distance estimation"""
+    
+    def __init__(self, servo_controller, logger=None):
+        self.servo = servo_controller
+        self.logger = logger
+        
+        # Frame properties
+        self.frame_center_x = 320
+        self.frame_center_y = 240
+        self.frame_width = 640
+        self.frame_height = 480
+        
+        # Distance calculator
+        self.distance_calculator = DistanceCalculator(self.frame_width, self.frame_height)
+        
+        # Tracking state
+        self.last_detection_time = time.time()
+        self.target_lost_frames = 0
+        self.lock_on_target = False
+        self.frame_skip_counter = 0
+        self.current_distance = 0.0
+        self.current_3d_position = (0.0, 0.0, 0.0)
+        
+        # Movement history for smoothing
+        self.pan_history = deque(maxlen=DETECTION_HISTORY_SIZE)
+        self.tilt_history = deque(maxlen=DETECTION_HISTORY_SIZE)
+        
+    def update_frame_properties(self, width, height):
+        """Update frame dimensions"""
+        if width != self.frame_width or height != self.frame_height:
+            self.frame_width = width
+            self.frame_height = height
+            self.frame_center_x = width // 2
+            self.frame_center_y = height // 2
+            self.distance_calculator.update_frame_size(width, height)
+            
+            if self.logger:
+                self.logger.log_event('resolution_change', f'Frame: {width}x{height}')
+        
+    def track_person(self, bbox, confidence, frame_count):
+        """Track detected person with distance estimation"""
+        self.frame_skip_counter += 1
+        if self.frame_skip_counter < FRAME_SKIP_COUNT:
+            return
+        self.frame_skip_counter = 0
+        
+        # Calculate distance
+        self.current_distance = self.distance_calculator.calculate_distance_from_bbox(bbox)
+        
+        # Get current servo angles
+        current_pan, current_tilt, pan_vel, tilt_vel = self.servo.get_current_state()
+        
+        # Calculate 3D position
+        x, y, z = self.distance_calculator.calculate_3d_position(
+            bbox, current_pan, current_tilt, self.current_distance
+        )
+        self.current_3d_position = (x, y, z)
+        
+        # Calculate angular size
+        angular_width, angular_height = self.distance_calculator.calculate_angular_size(bbox)
+        
+        # Calculate person center
+        center_x = (bbox.xmin() + bbox.width() * 0.5) * self.frame_width
+        center_y = (bbox.ymin() + bbox.height() * 0.5) * self.frame_height
+        
+        # Calculate error from frame center
+        error_x = center_x - self.frame_center_x
+        error_y = center_y - self.frame_center_y
+        
+        # Adjust dead zone based on distance (closer = smaller dead zone)
+        dynamic_dead_zone = DEAD_ZONE * (1 + self.current_distance / 10.0)
+        
+        # Move if outside dead zone
+        if abs(error_x) > dynamic_dead_zone or abs(error_y) > dynamic_dead_zone:
+            # Calculate adjustments with distance compensation
+            distance_factor = min(2.0, max(0.5, 2.0 / self.current_distance))
+            
+            pan_adjustment = -error_x * (PAN_SENSITIVITY / self.frame_width) * distance_factor
+            tilt_adjustment = error_y * (TILT_SENSITIVITY / self.frame_height) * distance_factor
+            
+            # Apply confidence boost
+            confidence_multiplier = min(2.0, confidence + 0.5)
+            pan_adjustment *= confidence_multiplier
+            tilt_adjustment *= confidence_multiplier
+            
+            # Smooth movement
+            target_pan = current_pan + pan_adjustment
+            target_tilt = current_tilt + tilt_adjustment
+            
+            new_pan = self._smooth_angle(current_pan, target_pan)
+            new_tilt = self._smooth_angle(current_tilt, target_tilt)
+            
+            # Apply smoothing history
+            self.pan_history.append(new_pan)
+            self.tilt_history.append(new_tilt)
+            
+            if len(self.pan_history) >= 2:
+                weights = [1.0, 2.0, 3.0][:len(self.pan_history)]
+                avg_pan = sum(w * angle for w, angle in zip(weights, self.pan_history)) / sum(weights)
+                avg_tilt = sum(w * angle for w, angle in zip(weights, self.tilt_history)) / sum(weights)
+            else:
+                avg_pan, avg_tilt = new_pan, new_tilt
+            
+            self.servo.move_to(avg_pan, avg_tilt)
+            
+            if not self.lock_on_target:
+                self.lock_on_target = True
+                if self.logger:
+                    self.logger.log_event('target_lock', 
+                        f'Target locked at {self.current_distance:.2f}m')
+                print(f"🎯 Target locked at {self.current_distance:.2f}m")
+        
+        self.last_detection_time = time.time()
+        self.target_lost_frames = 0
+        
+        # Log frame data with distance information
+        if self.logger:
+            distance_data = {
+                'distance': self.current_distance,
+                'x_position': x,
+                'y_position': y,
+                'z_position': z,
+                'angular_width': angular_width,
+                'angular_height': angular_height,
+                'bbox_width': bbox.width(),
+                'bbox_height': bbox.height()
+            }
+            
+            self.logger.log_frame_data(
+                frame_count, current_pan, current_tilt, pan_vel, tilt_vel,
+                confidence, True, self.is_tracking_active(), self.target_lost_frames,
+                distance_data
+            )
+    
+    def handle_lost_target(self, frame_count):
+        """Handle when no person detected"""
+        self.target_lost_frames += 1
+        
+        if self.target_lost_frames > 10 and self.lock_on_target:
+            self.lock_on_target = False
+            if self.logger:
+                self.logger.log_event('target_lost', 'Target lost - scanning mode')
+            print("🔍 Target lost - scanning mode")
+        
+        # Log no-detection frame
+        if self.logger:
+            current_pan, current_tilt, pan_vel, tilt_vel = self.servo.get_current_state()
+            self.logger.log_frame_data(
+                frame_count, current_pan, current_tilt, pan_vel, tilt_vel,
+                0.0, False, self.is_tracking_active(), self.target_lost_frames,
+                None
+            )
+    
+    def _smooth_angle(self, current, target):
+        """Apply smoothing to angle changes"""
+        diff = (target - current) * SMOOTHING_FACTOR
+        diff = max(-MAX_STEP_SIZE, min(MAX_STEP_SIZE, diff))
+        return current + diff
+    
+    def is_tracking_active(self):
+        """Check if tracking is active"""
+        return (time.time() - self.last_detection_time) < DETECTION_TIMEOUT
+    
+    def get_current_distance_info(self):
+        """Get current distance and position information"""
+        return {
+            'distance': self.current_distance,
+            'position_3d': self.current_3d_position
+        }
+
+# -----------------------------------------------------------------------------------------------
+# INITIALIZATION
+# -----------------------------------------------------------------------------------------------
+print("Initializing ULTRA-FAST servo system with GPS waypoint guidance...")
+
+# Initialize MAVLink connection first
+mavlink_handler = None
+try:
+    mavlink_handler = MAVLinkGPSHandler()
+    
+    # Try to set GUIDED mode if configured
+    if GUIDED_MODE_AUTO_SET:
+        time.sleep(2)  # Wait for connection to stabilize
+        mavlink_handler.set_guided_mode()
+        
+except Exception as e:
+    print(f"⚠️  MAVLink initialization failed: {e}")
+    print("   Continuing without GPS waypoint functionality")
+
+# Initialize data logger with GPS handler
+data_logger = ServoDataLogger(gps_handler=mavlink_handler)
+
+# Initialize servo controller
+fast_servo_controller = FastServoController(data_logger)
+
+# Initialize tracker
+tracker = UltraFastTracker(fast_servo_controller, data_logger)
+
+# Initialize calibration helper
+calibration_helper = CalibrationHelper()
+
+class OptimizedAppCallback(app_callback_class):
+    def __init__(self):
+        super().__init__()
+        self.frame_counter = 0
+        
+    def new_function(self):
+        return "Ultra-Fast Tracking with GPS Waypoint Guidance: "
+
+# -----------------------------------------------------------------------------------------------
+# MAIN CALLBACK
+# -----------------------------------------------------------------------------------------------
+def ultra_fast_app_callback(pad, info, user_data):
+    """Main processing callback with GPS waypoint creation"""
+    
+    buffer = info.get_buffer()
+    if buffer is None:
+        return Gst.PadProbeReturn.OK
+    
+    user_data.increment()
+    frame_count = user_data.get_count()
+    
+    # Update frame properties periodically
+    if frame_count % 30 == 0:
+        format, width, height = get_caps_from_pad(pad)
+        if width and height:
+            tracker.update_frame_properties(width, height)
+    
+    # Get frame for display
+    frame = None
+    if user_data.use_frame:
+        format, width, height = get_caps_from_pad(pad)
+        if format and width and height:
+            frame = get_numpy_from_buffer(buffer, format, width, height)
+    
+    # Process detections
+    roi = hailo.get_roi_from_buffer(buffer)
+    detections = roi.get_objects_typed(hailo.HAILO_DETECTION)
+    
+    # Find best person detection
+    best_person = None
+    best_area = 0
+    
+    for detection in detections:
+        if detection.get_label() == "person":
+            confidence = detection.get_confidence()
+            if confidence >= MIN_CONFIDENCE:
+                bbox = detection.get_bbox()
+                area = bbox.width() * bbox.height()
+                
+                if area > best_area:
+                    best_area = area
+                    best_person = {'bbox': bbox, 'confidence': confidence}
+    
+    # Track or handle lost target
+    if best_person:
+        tracker.track_person(best_person['bbox'], best_person['confidence'], frame_count)
+        
+        # Calibration mode
+        if calibration_helper.calibrating:
+            calibration_helper.add_measurement(best_person['bbox'], tracker.frame_height)
+        
+        if frame_count % 60 == 0:
+            distance_info = tracker.get_current_distance_info()
+            print(f"🏃 Tracking: Conf {best_person['confidence']:.2f}, "
+                  f"Distance: {distance_info['distance']:.2f}m")
+    else:
+        tracker.handle_lost_target(frame_count)
+    
+    # Enhanced frame annotation
+    if user_data.use_frame and frame is not None:
+        center_x, center_y = tracker.frame_center_x, tracker.frame_center_y
+        
+        # Crosshair
+        cv2.line(frame, (center_x - 15, center_y), (center_x + 15, center_y), (0, 255, 255), 1)
+        cv2.line(frame, (center_x, center_y - 15), (center_x, center_y + 15), (0, 255, 255), 1)
+        
+        # Status text with distance and GPS
+        if best_person:
+            distance_info = tracker.get_current_distance_info()
+            distance = distance_info['distance']
+            x, y, z = distance_info['position_3d']
+            
+            if calibration_helper.calibrating:
+                cv2.putText(frame, "CALIBRATION MODE", 
+                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                cv2.putText(frame, f"Place person at {CALIBRATION_DISTANCE}m", 
+                           (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                cv2.putText(frame, f"Measurements: {len(calibration_helper.measurements)}/10", 
+                           (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            else:
+                cv2.putText(frame, f"TRACKING: {distance:.2f}m", 
+                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            
+            cv2.putText(frame, f"3D Pos: ({x:.1f}, {y:.1f}, {z:.1f})m", 
+                       (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+            
+            # Show bearing to target
+            if mavlink_handler:
+                bearing = mavlink_handler.calculate_bearing(x, y)
+                cv2.putText(frame, f"Bearing: {bearing:.0f}°", 
+                           (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+            
+            # Draw bounding box if visible
+            if best_person['bbox']:
+                bbox = best_person['bbox']
+                x1 = int(bbox.xmin() * frame.shape[1])
+                y1 = int(bbox.ymin() * frame.shape[0])
+                x2 = int((bbox.xmin() + bbox.width()) * frame.shape[1])
+                y2 = int((bbox.ymin() + bbox.height()) * frame.shape[0])
+                
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                
+                # Distance label on bbox
+                cv2.putText(frame, f"{distance:.1f}m", 
+                           (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        
+        # Servo info
+        pan, tilt, pan_vel, tilt_vel = fast_servo_controller.get_current_state()
+        cv2.putText(frame, f"Pan: {pan:.1f}° ({pan_vel:.1f}°/s)", 
+                   (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+        cv2.putText(frame, f"Tilt: {tilt:.1f}° ({tilt_vel:.1f}°/s)", 
+                   (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+        cv2.putText(frame, f"Frame: {frame_count}", 
+                   (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+        
+        # GPS status
+        if mavlink_handler:
+            status = mavlink_handler.get_status()
+            gps_text = f"GPS: {status['satellites']} sats"
+            if status['gps_fix'] >= 3:
+                cv2.putText(frame, gps_text, (10, 160), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            else:
+                cv2.putText(frame, gps_text, (10, 160), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+            
+            cv2.putText(frame, f"Mode: {status['mode']}", (10, 180), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+            cv2.putText(frame, f"WP Sent: {status['points_logged']}", (10, 200), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+        
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        user_data.set_frame(frame)
+    
+    return Gst.PadProbeReturn.OK
+
+# -----------------------------------------------------------------------------------------------
+# MAIN EXECUTION
+# -----------------------------------------------------------------------------------------------
+if __name__ == "__main__":
+    project_root = Path(__file__).resolve().parent.parent
+    env_file = project_root / ".env"
+    env_path_str = str(env_file)
+    os.environ["HAILO_ENV_FILE"] = env_path_str
+    
+    user_data = OptimizedAppCallback()
+    app = GStreamerDetectionApp(ultra_fast_app_callback, user_data)
+    
+    print("🚀 Starting ULTRA-FAST tracking with GPS WAYPOINT GUIDANCE...")
+    
+    if CALIBRATION_MODE:
+        print("\n🎯 CALIBRATION MODE ACTIVE!")
+        print(f"   1. Place a person at EXACTLY {CALIBRATION_DISTANCE} meters from camera")
+        print("   2. Make sure they're standing upright and fully visible")
+        print("   3. System will take 10 measurements and calculate focal length")
+        print("   4. Update the constants with the calculated values\n")
+    
+    if mavlink_handler:
+        status = mavlink_handler.get_status()
+        print(f"\n🛰️ GPS Status:")
+        print(f"   Fix Type: {status['gps_fix']} (3=3D fix)")
+        print(f"   Satellites: {status['satellites']}")
+        print(f"   Current Position: {status['latitude']:.6f}, {status['longitude']:.6f}")
+        print(f"   Altitude: {status['altitude']:.1f}m")
+        print(f"   Mode: {status['mode']}")
+        print(f"\n📍 Waypoint Guidance Active!")
+        print(f"   Min detection distance: {MIN_DISTANCE_FOR_GPS}m")
+        print(f"   Waypoint altitude offset: {WAYPOINT_ALTITUDE_OFFSET}m")
+        print(f"   Update interval: {GPS_UPDATE_INTERVAL}s")
+        
+        if status['mode'] != 'GUIDED':
+            print(f"\n⚠️  Vehicle not in GUIDED mode!")
+            print(f"   Set GUIDED mode in GCS for immediate waypoint following")
+            print(f"   Or waypoints will be added to mission for AUTO mode")
+    else:
+        print("\n⚠️  No MAVLink connection - GPS waypoints disabled")
+    
+    print(f"\n📊 Data output location:")
+    print(f"   Directory: {data_logger.log_dir}")
+    print(f"   CSV file: {data_logger.csv_file.name}")
+    print(f"   GPS CSV: {data_logger.gps_csv_file.name}")
+    print(f"   JSON file: {data_logger.json_file.name}")
+    
+    print("\n📏 Distance Tracking Configuration:")
+    print(f"   Camera FOV: {CAMERA_FOV_HORIZONTAL}° x {CAMERA_FOV_VERTICAL}°")
+    print(f"   Camera tilt offset: {CAMERA_TILT_OFFSET}° (compensating for weight)")
+    print(f"   Average person height: {AVERAGE_PERSON_HEIGHT}m")
+    print(f"   Servo mount height: {SERVO_MOUNT_HEIGHT}m")
+    print(f"   Current focal length: {FOCAL_LENGTH_PIXELS} pixels")
+    
+    if not CALIBRATION_MODE:
+        print("\n💡 TIP: To calibrate your camera:")
+        print("   1. Set CALIBRATION_MODE = True at the top of the script")
+        print("   2. Restart the program and follow instructions")
+    
+    print("\n🎮 Controls:")
+    print("   - Detection creates waypoints automatically")
+    print("   - Set GUIDED mode for immediate navigation")
+    print("   - Set AUTO mode to follow mission waypoints")
+    print("   - Use RTL to return home")
+    
+    print("\nPress Ctrl+C to stop")
+    
+    try:
+        app.run()
+    except KeyboardInterrupt:
+        print("\n🛑 Stopping system...")
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        data_logger.log_event('error', f'Application error: {str(e)}')
+    finally:
+        print("📊 Finalizing logs...")
+        data_logger.finalize_session()
+        fast_servo_controller.shutdown()
+        
+        if mavlink_handler:
+            print("🛰️ Closing MAVLink connection...")
+            mavlink_handler.shutdown()
+        
+        print("✅ Shutdown complete")
